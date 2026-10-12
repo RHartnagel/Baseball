@@ -374,9 +374,29 @@ def cmd_predict(argv):
     print("saved", out)
 
 
+def cmd_list_pas(argv):
+    import argparse
+    from baseball_data import savant
+    ap = argparse.ArgumentParser(prog="spray_model.py list-pas")
+    ap.add_argument("--date", required=True, help="game date, YYYY-MM-DD")
+    ap.add_argument("--batter", type=int)
+    ap.add_argument("--pitcher", type=int)
+    ap.add_argument("--team", help="home or away team code, e.g. NYY")
+    ap.add_argument("--show", metavar="GAME_PK:AT_BAT", help="print full detail for one PA, e.g. 745000:42")
+    a = ap.parse_args(argv)
+    if a.show:
+        gp, ab = a.show.split(":")
+        pa = savant.get_plate_appearance(int(gp), int(ab), a.date)
+        for k, v in pa.items():
+            print(f"{k}: {v}")
+        return
+    pas = savant.find_plate_appearances(a.date, a.batter, a.pitcher, a.team)
+    print(pas.to_string() if len(pas) else "no balls in play matched")
+
+
 if __name__ == "__main__":
     usage = ("usage: spray_model.py train 2023 [2022 ...] | validate <train_seasons,comma> <test_season> "
-             "| predict --batter ID --p-throws R [options]")
+             "| predict --batter ID --p-throws R [options] | list-pas --date YYYY-MM-DD [--show PK:AB]")
     if len(sys.argv) < 3:
         sys.exit(usage)
     if sys.argv[1] == "train":
@@ -385,5 +405,7 @@ if __name__ == "__main__":
         cmd_validate([int(s) for s in sys.argv[2].split(",")], int(sys.argv[3]))
     elif sys.argv[1] == "predict":
         cmd_predict(sys.argv[2:])
+    elif sys.argv[1] == "list-pas":
+        cmd_list_pas(sys.argv[2:])
     else:
         sys.exit(usage)

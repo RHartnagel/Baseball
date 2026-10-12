@@ -60,12 +60,14 @@ def drop_battery(sims):
     return sims[~battery_fielded(sims)]
 
 
-def _prep(sims, max_ft=200):
+def _prep(sims, max_ft=200, max_pts=MAX_PTS):
+    """Ground-ball landing points as an array [x_ft, y_ft(, ev)]; `ev` is included when sims has it."""
     sims = drop_battery(sims)
     gb = sims[(sims["bb_type"] == "ground_ball") & (sims["distance_ft"] <= max_ft)]
-    if len(gb) > MAX_PTS:
-        gb = gb.sample(MAX_PTS, random_state=0)
-    return gb[["x_ft", "y_ft"]].to_numpy(), len(gb)
+    if len(gb) > max_pts:
+        gb = gb.sample(max_pts, random_state=0)
+    cols = ["x_ft", "y_ft"] + (["ev"] if "ev" in gb else [])
+    return gb[cols].to_numpy(), len(gb)
 
 
 def _candidates(shift_rules, step=4):
@@ -78,28 +80,36 @@ def _candidates(shift_rules, step=4):
 
 
 def _kernel(a, b, reach_ft):
-    d2 = ((a[:, None, :] - b[None, :, :]) ** 2).sum(-1)
+    d2 = ((a[:, None, :2] - b[None, :, :2]) ** 2).sum(-1)
     return np.exp(-d2 / reach_ft**2).astype(np.float32)
 
 
-def coverage_score(positions, sims, reach_ft=DEFAULT_REACH_FT):
-    """Expected share of simulated ground balls fielded, for {label: (x, y)} positions."""
-    pts, n = _prep(sims)
+def coverage_score(positions, sims, reach_ft=DEFAULT_REACH_FT, kernel_fn=None, max_pts=MAX_PTS):
+    """Expected share of simulated ground balls fielded, for {label: (x, y)} positions.
+
+    kernel_fn(label, candidates (m,2), pts (n,2or3)) -> (m, n) fielding probabilities replaces the
+    placeholder exponential-reach kernel (e.g. the learned out model in pa_view.py).
+    """
+    pts, n = _prep(sims, max_pts=max_pts)
     if n == 0 or not positions:
         return 0.0
-    rows = [_kernel(np.array([xy], dtype=float), pts, reach_for(lab, reach_ft))[0]
-            for lab, xy in positions.items()]
+    if kernel_fn is None:
+        rows = [_kernel(np.array([xy], dtype=float), pts, reach_for(lab, reach_ft))[0]
+                for lab, xy in positions.items()]
+    else:
+        rows = [kernel_fn(lab, np.array([xy], dtype=float), pts)[0] for lab, xy in positions.items()]
     return float(np.max(rows, axis=0).mean())
 
 
-def optimal_infield_positions(sims, reach_ft=DEFAULT_REACH_FT, shift_rules=True, rounds=10):
+def optimal_infield_positions(sims, reach_ft=DEFAULT_REACH_FT, shift_rules=True, rounds=10,
+                              kernel_fn=None, max_pts=MAX_PTS):
     """Return ({label: (x, y)}, coverage) maximizing expected ground-ball coverage.
 
     With shift_rules, each of 3B/SS/2B/1B is limited to its ZONES entry (side of second base, distance
     from its bag) and the infield dirt, 1B has a reduced reach and is pulled toward its anchor. Without,
     four unconstrained slots are labeled F1..F4 left to right.
     """
-    pts, n = _prep(sims)
+    pts, n = _prep(sims, max_pts=max_pts)
     if n == 0:
         return {}, 0.0
     cand = _candidates(shift_rules)
@@ -120,7 +130,10 @@ def optimal_infield_positions(sims, reach_ft=DEFAULT_REACH_FT, shift_rules=True,
         if not len(idx):
             raise ValueError(f"no candidate spots for {slot}; zones are too tight for the grid")
         allowed[slot], penalty[slot] = idx, pen[idx]
-        kern[slot] = _kernel(cand[idx], pts, reach_for(slot, reach_ft))  # (allowed candidates, balls)
+        if kernel_fn is None:
+            kern[slot] = _kernel(cand[idx], pts, reach_for(slot, reach_ft))  # (allowed candidates, balls)
+        else:
+            kern[slot] = kernel_fn(slot, cand[idx], pts).astype(np.float32)
 
     def best(base, slot):
         score = np.maximum(kern[slot] - base, 0).sum(axis=1) - penalty[slot]
@@ -145,7 +158,7 @@ def optimal_infield_positions(sims, reach_ft=DEFAULT_REACH_FT, shift_rules=True,
     spots = {slot: tuple(float(v) for v in cand[allowed[slot][k]]) for slot, k in chosen.items()}
     if not shift_rules:
         spots = {f"F{i + 1}": sp for i, sp in enumerate(sorted(spots.values(), key=lambda q: q[0]))}
-    return spots, coverage_score(spots, sims, reach_ft)
+    return spots, coverage_score(spots, sims, reach_ft, kernel_fn, max_pts)
 
 
 def compare_to_actual(optimal, actual, sims, reach_ft=DEFAULT_REACH_FT):
