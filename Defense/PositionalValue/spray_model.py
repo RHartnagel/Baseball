@@ -36,6 +36,16 @@ CAT = ["pitch_type", "home_team"]
 NUM = ["is_rhb", "is_rhp", "balls", "strikes", "outs_when_up", "on_1b", "on_2b", "on_3b", "inning",
        "score_diff", "release_speed", "pfx_x", "pfx_z", "plate_x_in", "plate_z",
        "bat_pull_mean", "bat_pull_vs_hand_mean", "bat_gb_rate", "bat_n"]
+# Extra shrunk-history features, added cumulatively so each level can be ablated (see cmd_ablate):
+HAND_NUM = ["bat_gb_vs_hand"]                                      # batter's GB rate vs this pitcher hand
+PITCHER_NUM = ["pit_pull_mean", "pit_gb_rate", "pit_n",            # what this pitcher allows, overall
+               "pit_pull_vs_side_mean", "pit_gb_vs_side", "pit_n_side"]  # ... vs this batter's side
+MATCHUP_NUM = ["mu_pull_mean", "mu_gb_rate", "mu_n"]               # this batter vs this pitcher
+ARMS = {"base": NUM + CAT,
+        "+hand": NUM + HAND_NUM + CAT,
+        "+pitcher": NUM + HAND_NUM + PITCHER_NUM + CAT,
+        "+matchup": NUM + HAND_NUM + PITCHER_NUM + MATCHUP_NUM + CAT}
+MATCHUP_K = 15  # batter x pitcher pairs are sparse; shrink them toward the league mean with a smaller prior
 
 
 def load_batted_balls(seasons):
@@ -83,6 +93,12 @@ def _shrunk(train, test, keys, col, k=SHRINK_K):
 
 
 def add_batter_features(train, test):
+    """Add all shrunk-history features (batter, batter vs hand, pitcher, pitcher vs side, matchup).
+
+    Every history level is an empirical-Bayes mean toward the league mean with its own sample count, so the
+    models can learn how much to trust a thin matchup history versus the broader levels. Train rows use
+    out-of-fold aggregates (see _shrunk); test rows use the full training aggregate.
+    """
     train, test = train.copy(), test.copy()
     tr, n_tr, te, n_te = _shrunk(train, test, ["batter"], "pull_angle")
     train["bat_pull_mean"], train["bat_n"], test["bat_pull_mean"], test["bat_n"] = tr, n_tr, te, n_te
@@ -90,10 +106,25 @@ def add_batter_features(train, test):
     train["bat_pull_vs_hand_mean"], test["bat_pull_vs_hand_mean"] = tr, te
     tr, _, te, _ = _shrunk(train, test, ["batter"], "is_gb")
     train["bat_gb_rate"], test["bat_gb_rate"] = tr, te
+    tr, _, te, _ = _shrunk(train, test, ["batter", "p_throws"], "is_gb")
+    train["bat_gb_vs_hand"], test["bat_gb_vs_hand"] = tr, te
+    tr, n_tr, te, n_te = _shrunk(train, test, ["pitcher"], "pull_angle")
+    train["pit_pull_mean"], train["pit_n"], test["pit_pull_mean"], test["pit_n"] = tr, n_tr, te, n_te
+    tr, _, te, _ = _shrunk(train, test, ["pitcher"], "is_gb")
+    train["pit_gb_rate"], test["pit_gb_rate"] = tr, te
+    tr, n_tr, te, n_te = _shrunk(train, test, ["pitcher", "stand"], "pull_angle")
+    train["pit_pull_vs_side_mean"], train["pit_n_side"] = tr, n_tr
+    test["pit_pull_vs_side_mean"], test["pit_n_side"] = te, n_te
+    tr, _, te, _ = _shrunk(train, test, ["pitcher", "stand"], "is_gb")
+    train["pit_gb_vs_side"], test["pit_gb_vs_side"] = tr, te
+    tr, n_tr, te, n_te = _shrunk(train, test, ["batter", "pitcher"], "pull_angle", k=MATCHUP_K)
+    train["mu_pull_mean"], train["mu_n"], test["mu_pull_mean"], test["mu_n"] = tr, n_tr, te, n_te
+    tr, _, te, _ = _shrunk(train, test, ["batter", "pitcher"], "is_gb", k=MATCHUP_K)
+    train["mu_gb_rate"], test["mu_gb_rate"] = tr, te
     return train, test
 
 
-FEATS = NUM + CAT
+FEATS = ARMS["base"]  # default: pitcher/matchup arms did not beat this on 2023->2024 (see data/baselines)
 POOL_COLS = ["stand", "p_throws", "pitch_type", "release_speed", "pfx_x", "pfx_z", "plate_x_in", "plate_z",
              "home_team"]
 MODEL_DIR = Path(__file__).resolve().parents[2] / "data" / "models"
@@ -109,41 +140,45 @@ def _clf():
                                           random_state=0)
 
 
-def fit(train):
-    """Fit all models on `train` (which must already have batter features).
+def fit(train, feats=None, by_type=True):
+    """Fit all models on `train` (which must already have the history features).
 
     models["bb_type"], ["direction"]: classifiers.  models["angle"], ["distance"]: overall regressors.
     models["by_type"][t] = {"angle", "distance"} regressors fit on batted balls of type t; these drive
-    the contact simulator (pick a type, then place the ball).
+    the contact simulator (pick a type, then place the ball). `by_type=False` skips them (ablations).
+    models["feats"] records the feature list used.
     """
-    models = {"angle": _reg().fit(train[FEATS], train["pull_angle"]),
-              "distance": _reg().fit(train[FEATS], train["distance_ft"]),
-              "bb_type": _clf().fit(train[FEATS], train["bb_type"]),
-              "direction": _clf().fit(train[FEATS], train["direction"]),
+    feats = list(feats or FEATS)
+    models = {"feats": feats,
+              "angle": _reg().fit(train[feats], train["pull_angle"]),
+              "distance": _reg().fit(train[feats], train["distance_ft"]),
+              "bb_type": _clf().fit(train[feats], train["bb_type"]),
+              "direction": _clf().fit(train[feats], train["direction"]),
               "by_type": {}}
-    for t in BB_TYPES:
+    for t in (BB_TYPES if by_type else []):
         sub = train[train["bb_type"] == t]
-        models["by_type"][t] = {"angle": _reg().fit(sub[FEATS], sub["pull_angle"]),
-                                "distance": _reg().fit(sub[FEATS], sub["distance_ft"])}
+        models["by_type"][t] = {"angle": _reg().fit(sub[feats], sub["pull_angle"]),
+                                "distance": _reg().fit(sub[feats], sub["distance_ft"])}
     return models
 
 
 def evaluate(models, train, test):
     """Score fitted models on `test` against simple baselines (both frames need batter features)."""
     results = {}
+    F = models["feats"]
     hand = test[["stand", "p_throws"]].merge(
         train.groupby(["stand", "p_throws"])["pull_angle"].mean().rename("m"),
         left_on=["stand", "p_throws"], right_index=True, how="left")["m"].to_numpy()
     results["pull_angle MAE (deg)"] = {
-        "model": mean_absolute_error(test["pull_angle"], models["angle"].predict(test[FEATS])),
+        "model": mean_absolute_error(test["pull_angle"], models["angle"].predict(test[F])),
         "league mean": mean_absolute_error(test["pull_angle"], np.full(len(test), train["pull_angle"].mean())),
         "stand x p_throws mean": mean_absolute_error(test["pull_angle"], hand)}
     results["distance MAE (ft)"] = {
-        "model": mean_absolute_error(test["distance_ft"], models["distance"].predict(test[FEATS])),
+        "model": mean_absolute_error(test["distance_ft"], models["distance"].predict(test[F])),
         "league mean": mean_absolute_error(test["distance_ft"], np.full(len(test), train["distance_ft"].mean()))}
     for target in ("direction", "bb_type"):
         clf = models[target]
-        p = clf.predict_proba(test[FEATS])
+        p = clf.predict_proba(test[F])
         prior = train[target].value_counts(normalize=True).reindex(clf.classes_).to_numpy()
         results[f"{target} log-loss"] = {
             "model": log_loss(test[target], p, labels=clf.classes_),
@@ -157,8 +192,9 @@ def holdout_residuals(models, test):
     for t in BB_TYPES:
         sub = test[test["bb_type"] == t]
         m = models["by_type"][t]
-        res[t] = np.column_stack([sub["pull_angle"] - m["angle"].predict(sub[FEATS]),
-                                  sub["distance_ft"] - m["distance"].predict(sub[FEATS])])
+        F = models["feats"]
+        res[t] = np.column_stack([sub["pull_angle"] - m["angle"].predict(sub[F]),
+                                  sub["distance_ft"] - m["distance"].predict(sub[F])])
     return res
 
 
@@ -189,15 +225,61 @@ def cmd_train(seasons):
     joblib.dump({
         "models": models, "residuals": residuals, "seasons": seasons,
         "categories": {c: list(data[c].cat.categories) for c in CAT},
-        "train": data[["batter", "p_throws", "stand", "pull_angle", "is_gb", "direction", "bb_type",
+        "train": data[["batter", "pitcher", "p_throws", "stand", "pull_angle", "is_gb", "direction", "bb_type",
                        "distance_ft"]],
-        "pool": data[POOL_COLS].sample(min(30000, len(data)), random_state=0).reset_index(drop=True),
+        # every batted-ball pitch (with its pitcher), so a named pitcher's own pitch mix can be sampled
+        "pool": data[POOL_COLS + ["pitcher"]].reset_index(drop=True),
     }, out)
     print("saved", out)
 
 
 def load_bundle(seasons):
     return joblib.load(MODEL_DIR / f"spray_{'_'.join(map(str, seasons))}.joblib")
+
+
+def _segments(test):
+    """Row masks for the slices where the new history levels can matter (as seen in training)."""
+    return {"all test BIP": np.ones(len(test), bool),
+            "pitcher seen (>=30 train BIP)": (test["pit_n"] >= 30).to_numpy(),
+            "pitcher unseen (<5)": (test["pit_n"] < 5).to_numpy(),
+            "batter-pitcher pair seen (>=1)": (test["mu_n"] >= 1).to_numpy(),
+            "batter-pitcher pair seen (>=3)": (test["mu_n"] >= 3).to_numpy()}
+
+
+def cmd_ablate(train_seasons, test_season, out=None):
+    """Fit one overall-model set per feature arm (same split) and compare on all rows and on segments."""
+    train = load_batted_balls(train_seasons)
+    test = load_batted_balls([test_season])
+    for c in CAT:  # align category codes
+        cats = list(train[c].cat.categories)
+        test[c] = pd.Categorical(test[c].astype(object), categories=cats)
+    train, test = add_batter_features(train, test)
+    segs = _segments(test)
+    print(f"train {len(train):,} BIP ({train_seasons})  test {len(test):,} BIP ({test_season})")
+    print("segment sizes:", {k: int(m.sum()) for k, m in segs.items()})
+    table = {}
+    for arm, feats in ARMS.items():
+        print(f"fitting arm {arm} ({len(feats)} features) ...", flush=True)
+        models = fit(train, feats, by_type=False)
+        for seg, mask in segs.items():
+            r = evaluate(models, train, test[mask])
+            table[(seg, arm)] = {"pull MAE": r["pull_angle MAE (deg)"]["model"],
+                                 "dist MAE": r["distance MAE (ft)"]["model"],
+                                 "dir LL": r["direction log-loss"]["model"],
+                                 "bbtype LL": r["bb_type log-loss"]["model"]}
+    lines = []
+    for seg in segs:
+        lines.append(f"\n[{seg}]  n={int(segs[seg].sum()):,}")
+        base = table[(seg, "base")]
+        for arm in ARMS:
+            m = table[(seg, arm)]
+            lines.append(f"  {arm:10s} " + "  ".join(
+                f"{k} {m[k]:.4f} ({m[k] - base[k]:+.4f})" for k in m))
+    text = "\n".join(lines)
+    print(text)
+    if out:
+        Path(out).parent.mkdir(parents=True, exist_ok=True)
+        Path(out).write_text(text, encoding="utf-8")
 
 
 def cmd_validate(train_seasons, test_season):
@@ -211,11 +293,15 @@ def cmd_validate(train_seasons, test_season):
 
 
 def predict_contact(bundle, batter, p_throws, balls=0, strikes=0, outs=0, on_1b=0, on_2b=0, on_3b=0,
-                    inning=5, score_diff=0, park=None, stand=None, pitch_type=None, n=3000, seed=0):
+                    inning=5, score_diff=0, park=None, stand=None, pitch_type=None, n=3000, seed=0,
+                    pitcher=None):
     """Simulate `n` batted balls for one batter in one situation.
 
     Unspecified pitch details (type/speed/movement/location) are marginalized by drawing real pitches
-    thrown by `p_throws` to that batter's side from the training pool. Returns a DataFrame with
+    thrown by `p_throws` to that batter's side from the training pool. With `pitcher` (MLBAM id) the draw is
+    from that pitcher's own pitches (his pitch mix), and his tendencies / the batter-vs-pitcher history feed
+    the model; otherwise each drawn pitch carries its real pitcher, which marginalizes over pitchers.
+    Returns a DataFrame with
     bb_type, pull_angle, spray_angle (deg, 0 = CF, + = RF side), distance_ft, x_ft, y_ft (home = 0,0).
     """
     rng = np.random.default_rng(seed)
@@ -229,6 +315,20 @@ def predict_contact(bundle, batter, p_throws, balls=0, strikes=0, outs=0, on_1b=
         else:
             raise ValueError(f"batter {batter} not in training data; pass stand='L' or 'R'")
     pool = bundle["pool"]
+    if "pitcher" not in pool:  # old bundle: no pitcher information
+        pool = pool.assign(pitcher=-1)
+    elif pitcher is not None:
+        mine = pool[pool["pitcher"] == pitcher]
+        vs_side = mine[mine["stand"] == stand]
+        if len(vs_side) >= 30:
+            pool = vs_side
+        elif len(mine) >= 30:
+            print(f"note: pitcher {pitcher} has only {len(vs_side)} batted balls vs {stand}HB; using all his pitches")
+            pool = mine
+        else:
+            print(f"note: pitcher {pitcher} has {len(mine)} batted balls in training; using the {p_throws}HP pool "
+                  f"(his tendencies are league-average)")
+            pool = pool.assign(pitcher=pitcher)  # features resolve to league mean when he is unseen
     pool = pool[(pool["stand"] == stand) & (pool["p_throws"] == p_throws)]
     if pitch_type:
         pool = pool[pool["pitch_type"] == pitch_type]
@@ -244,11 +344,14 @@ def predict_contact(bundle, batter, p_throws, balls=0, strikes=0, outs=0, on_1b=
     X["inning"], X["score_diff"] = inning, score_diff
     for c, cats in bundle["categories"].items():
         X[c] = pd.Categorical(X[c].astype(object), categories=cats)
-    stub = train[["batter", "p_throws", "pull_angle", "is_gb"]]
+    if "pitcher" not in train:
+        train = train.assign(pitcher=-1)
+    stub = train[["batter", "pitcher", "stand", "p_throws", "pull_angle", "is_gb"]]
     _, X = add_batter_features(stub, X)
+    F = models.get("feats", NUM + CAT)  # old bundles were trained on the base feature set
 
     clf = models["bb_type"]
-    cum = clf.predict_proba(X[FEATS]).cumsum(axis=1)
+    cum = clf.predict_proba(X[F]).cumsum(axis=1)
     types = clf.classes_[(rng.random(n)[:, None] > cum).sum(axis=1).clip(0, len(clf.classes_) - 1)]
     pull = np.empty(n)
     dist = np.empty(n)
@@ -258,8 +361,8 @@ def predict_contact(bundle, batter, p_throws, balls=0, strikes=0, outs=0, on_1b=
             continue
         m = models["by_type"][t]
         r = bundle["residuals"][t][rng.integers(0, len(bundle["residuals"][t]), len(idx))]
-        pull[idx] = m["angle"].predict(X.iloc[idx][FEATS]) + r[:, 0]
-        dist[idx] = np.maximum(m["distance"].predict(X.iloc[idx][FEATS]) + r[:, 1], 5)
+        pull[idx] = m["angle"].predict(X.iloc[idx][F]) + r[:, 0]
+        dist[idx] = np.maximum(m["distance"].predict(X.iloc[idx][F]) + r[:, 1], 5)
     spray = -pull if stand == "R" else pull  # righties pull toward LF (negative spray angle)
     ang = np.radians(spray)
     return pd.DataFrame({"bb_type": types, "pull_angle": pull, "spray_angle": spray, "distance_ft": dist,
@@ -332,6 +435,7 @@ def cmd_predict(argv):
     ap.add_argument("--batter", type=int, required=True, help="MLBAM player id")
     ap.add_argument("--p-throws", choices=["L", "R"], required=True)
     ap.add_argument("--stand", choices=["L", "R"], help="only needed for batters not in training data")
+    ap.add_argument("--pitcher", type=int, help="MLBAM pitcher id: use his pitch mix and tendencies")
     ap.add_argument("--balls", type=int, default=0)
     ap.add_argument("--strikes", type=int, default=0)
     ap.add_argument("--outs", type=int, default=0)
@@ -351,7 +455,7 @@ def cmd_predict(argv):
     bundle = load_bundle([int(s) for s in a.seasons.split(",")])
     sims = predict_contact(bundle, a.batter, a.p_throws, a.balls, a.strikes, a.outs,
                            int(a.on1b), int(a.on2b), int(a.on3b), park=a.park, stand=a.stand,
-                           pitch_type=a.pitch_type, n=a.n)
+                           pitch_type=a.pitch_type, n=a.n, pitcher=a.pitcher)
     print(sims.groupby("bb_type")[["spray_angle", "distance_ft"]].agg(["mean", "median"]).round(1))
     print("P(type):", sims["bb_type"].value_counts(normalize=True).round(3).to_dict())
     runners = "".join(b for b, f in (("1", a.on1b), ("2", a.on2b), ("3", a.on3b)) if f) or "none"
@@ -396,7 +500,8 @@ def cmd_list_pas(argv):
 
 if __name__ == "__main__":
     usage = ("usage: spray_model.py train 2023 [2022 ...] | validate <train_seasons,comma> <test_season> "
-             "| predict --batter ID --p-throws R [options] | list-pas --date YYYY-MM-DD [--show PK:AB]")
+             "| predict --batter ID --p-throws R [--pitcher ID ...] | list-pas --date YYYY-MM-DD [--show PK:AB] "
+             "| ablate <train_seasons,comma> <test_season>")
     if len(sys.argv) < 3:
         sys.exit(usage)
     if sys.argv[1] == "train":
@@ -405,6 +510,10 @@ if __name__ == "__main__":
         cmd_validate([int(s) for s in sys.argv[2].split(",")], int(sys.argv[3]))
     elif sys.argv[1] == "predict":
         cmd_predict(sys.argv[2:])
+    elif sys.argv[1] == "ablate" and len(sys.argv) == 4:
+        tag = f"{sys.argv[2].replace(',', '_')}_{sys.argv[3]}"
+        cmd_ablate([int(x) for x in sys.argv[2].split(",")], int(sys.argv[3]),
+                   MODEL_DIR.parent / "baselines" / f"ablate_{tag}.txt")
     elif sys.argv[1] == "list-pas":
         cmd_list_pas(sys.argv[2:])
     else:
