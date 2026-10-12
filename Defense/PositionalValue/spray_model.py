@@ -4,6 +4,7 @@ Targets (batted balls only, i.e. conditional on contact in play):
   * pull_angle   - degrees; + = pulled side regardless of batter handedness
   * direction    - pull / center / oppo class from pull_angle
   * bb_type      - ground_ball / line_drive / fly_ball / popup
+  * distance_ft  - distance from home plate to where the ball was first touched / landed
 
 Features are everything knowable before contact: batter + pitcher handedness,
 count, pitch type/location/velocity, base-out state, score, park, plus
@@ -12,6 +13,7 @@ out-of-fold on training rows so the model can't memorize its own labels.
 
 Run:  .venv\Scripts\python.exe Defense\PositionalValue\spray_model.py train 2023
       .venv\Scripts\python.exe Defense\PositionalValue\spray_model.py validate 2023 2024
+      .venv\Scripts\python.exe Defense\PositionalValue\spray_model.py predict --batter 592450 --p-throws R --outs 1 --on1b
 """
 import sys
 from pathlib import Path
@@ -90,38 +92,57 @@ def add_batter_features(train, test):
     return train, test
 
 
+FEATS = NUM + CAT
+POOL_COLS = ["stand", "p_throws", "pitch_type", "release_speed", "pfx_x", "pfx_z", "plate_x_in", "plate_z",
+             "home_team"]
+MODEL_DIR = Path(__file__).resolve().parents[2] / "data" / "models"
+
+
+def _reg():
+    return HistGradientBoostingRegressor(categorical_features="from_dtype", max_iter=300, learning_rate=0.05,
+                                         random_state=0)
+
+
 def _clf():
     return HistGradientBoostingClassifier(categorical_features="from_dtype", max_iter=300, learning_rate=0.05,
                                           random_state=0)
 
 
 def fit(train):
-    """Fit all three models on `train` (which must already have batter features)."""
-    feats = NUM + CAT
-    reg = HistGradientBoostingRegressor(categorical_features="from_dtype", max_iter=300, learning_rate=0.05,
-                                        random_state=0)
-    reg.fit(train[feats], train["pull_angle"])
-    models = {"angle": reg}
-    for target in ("direction", "bb_type"):
-        models[target] = _clf().fit(train[feats], train[target])
+    """Fit all models on `train` (which must already have batter features).
+
+    models["bb_type"], ["direction"]: classifiers.  models["angle"], ["distance"]: overall regressors.
+    models["by_type"][t] = {"angle", "distance"} regressors fit on batted balls of type t; these drive
+    the contact simulator (pick a type, then place the ball).
+    """
+    models = {"angle": _reg().fit(train[FEATS], train["pull_angle"]),
+              "distance": _reg().fit(train[FEATS], train["distance_ft"]),
+              "bb_type": _clf().fit(train[FEATS], train["bb_type"]),
+              "direction": _clf().fit(train[FEATS], train["direction"]),
+              "by_type": {}}
+    for t in BB_TYPES:
+        sub = train[train["bb_type"] == t]
+        models["by_type"][t] = {"angle": _reg().fit(sub[FEATS], sub["pull_angle"]),
+                                "distance": _reg().fit(sub[FEATS], sub["distance_ft"])}
     return models
 
 
 def evaluate(models, train, test):
     """Score fitted models on `test` against simple baselines (both frames need batter features)."""
-    feats = NUM + CAT
     results = {}
-    pred = models["angle"].predict(test[feats])
-    base = np.full(len(test), train["pull_angle"].mean())
     hand = test[["stand", "p_throws"]].merge(
         train.groupby(["stand", "p_throws"])["pull_angle"].mean().rename("m"),
         left_on=["stand", "p_throws"], right_index=True, how="left")["m"].to_numpy()
-    results["pull_angle MAE (deg)"] = {"model": mean_absolute_error(test["pull_angle"], pred),
-                                       "league mean": mean_absolute_error(test["pull_angle"], base),
-                                       "stand x p_throws mean": mean_absolute_error(test["pull_angle"], hand)}
+    results["pull_angle MAE (deg)"] = {
+        "model": mean_absolute_error(test["pull_angle"], models["angle"].predict(test[FEATS])),
+        "league mean": mean_absolute_error(test["pull_angle"], np.full(len(test), train["pull_angle"].mean())),
+        "stand x p_throws mean": mean_absolute_error(test["pull_angle"], hand)}
+    results["distance MAE (ft)"] = {
+        "model": mean_absolute_error(test["distance_ft"], models["distance"].predict(test[FEATS])),
+        "league mean": mean_absolute_error(test["distance_ft"], np.full(len(test), train["distance_ft"].mean()))}
     for target in ("direction", "bb_type"):
         clf = models[target]
-        p = clf.predict_proba(test[feats])
+        p = clf.predict_proba(test[FEATS])
         prior = train[target].value_counts(normalize=True).reindex(clf.classes_).to_numpy()
         results[f"{target} log-loss"] = {
             "model": log_loss(test[target], p, labels=clf.classes_),
@@ -129,12 +150,20 @@ def evaluate(models, train, test):
     return results
 
 
+def holdout_residuals(models, test):
+    """Out-of-sample (angle, distance) residuals per batted-ball type; they give simulated balls realistic spread."""
+    res = {}
+    for t in BB_TYPES:
+        sub = test[test["bb_type"] == t]
+        m = models["by_type"][t]
+        res[t] = np.column_stack([sub["pull_angle"] - m["angle"].predict(sub[FEATS]),
+                                  sub["distance_ft"] - m["distance"].predict(sub[FEATS])])
+    return res
+
+
 def _print(results):
     for metric, vals in results.items():
         print(" ", metric, {k: round(v, 4) for k, v in vals.items()})
-
-
-MODEL_DIR = Path(__file__).resolve().parents[2] / "data" / "models"
 
 
 def cmd_train(seasons):
@@ -146,20 +175,32 @@ def cmd_train(seasons):
     early, late = data[data["game_date"] < cut], data[data["game_date"] >= cut]
     tr, te = add_batter_features(early, late)
     print(f"within-season holdout: train {len(tr):,} (< {cut})  test {len(te):,}")
-    _print(evaluate(fit(tr), tr, te))
-    # Final model on everything. Save the training frame subset needed to rebuild batter features.
+    holdout_models = fit(tr)
+    _print(evaluate(holdout_models, tr, te))
+    residuals = holdout_residuals(holdout_models, te)
+
+    # Final model on everything.
     full, _ = add_batter_features(data, data.head(0))
     models = fit(full)
+
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
     out = MODEL_DIR / f"spray_{'_'.join(map(str, seasons))}.joblib"
-    cats = {c: list(data[c].cat.categories) for c in CAT}
-    joblib.dump({"models": models, "categories": cats, "seasons": seasons,
-                 "train": data[["batter", "p_throws", "stand", "pull_angle", "is_gb", "direction", "bb_type"]]}, out)
+    joblib.dump({
+        "models": models, "residuals": residuals, "seasons": seasons,
+        "categories": {c: list(data[c].cat.categories) for c in CAT},
+        "train": data[["batter", "p_throws", "stand", "pull_angle", "is_gb", "direction", "bb_type",
+                       "distance_ft"]],
+        "pool": data[POOL_COLS].sample(min(30000, len(data)), random_state=0).reset_index(drop=True),
+    }, out)
     print("saved", out)
 
 
+def load_bundle(seasons):
+    return joblib.load(MODEL_DIR / f"spray_{'_'.join(map(str, seasons))}.joblib")
+
+
 def cmd_validate(train_seasons, test_season):
-    bundle = joblib.load(MODEL_DIR / f"spray_{'_'.join(map(str, train_seasons))}.joblib")
+    bundle = load_bundle(train_seasons)
     test = load_batted_balls([test_season])
     for c, cats in bundle["categories"].items():  # align category codes with training
         test[c] = pd.Categorical(test[c].astype(object), categories=cats)
@@ -168,13 +209,148 @@ def cmd_validate(train_seasons, test_season):
     _print(evaluate(bundle["models"], train, test))
 
 
+def predict_contact(bundle, batter, p_throws, balls=0, strikes=0, outs=0, on_1b=0, on_2b=0, on_3b=0,
+                    inning=5, score_diff=0, park=None, stand=None, pitch_type=None, n=3000, seed=0):
+    """Simulate `n` batted balls for one batter in one situation.
+
+    Unspecified pitch details (type/speed/movement/location) are marginalized by drawing real pitches
+    thrown by `p_throws` to that batter's side from the training pool. Returns a DataFrame with
+    bb_type, pull_angle, spray_angle (deg, 0 = CF, + = RF side), distance_ft, x_ft, y_ft (home = 0,0).
+    """
+    rng = np.random.default_rng(seed)
+    train, models = bundle["train"], bundle["models"]
+    if stand is None:
+        sides = train.loc[train["batter"] == batter, "stand"].unique()
+        if len(sides) == 1:
+            stand = sides[0]
+        elif len(sides) > 1:  # switch hitter: bats from the side opposite the pitcher's hand
+            stand = "L" if p_throws == "R" else "R"
+        else:
+            raise ValueError(f"batter {batter} not in training data; pass stand='L' or 'R'")
+    pool = bundle["pool"]
+    pool = pool[(pool["stand"] == stand) & (pool["p_throws"] == p_throws)]
+    if pitch_type:
+        pool = pool[pool["pitch_type"] == pitch_type]
+    if pool.empty:
+        raise ValueError("no pitches in the pool match those filters")
+    X = pool.sample(n, replace=True, random_state=seed).reset_index(drop=True)
+    if park:
+        X["home_team"] = park
+    X["batter"] = batter
+    X["is_rhb"], X["is_rhp"] = int(stand == "R"), int(p_throws == "R")
+    X["balls"], X["strikes"], X["outs_when_up"] = balls, strikes, outs
+    X["on_1b"], X["on_2b"], X["on_3b"] = on_1b, on_2b, on_3b
+    X["inning"], X["score_diff"] = inning, score_diff
+    for c, cats in bundle["categories"].items():
+        X[c] = pd.Categorical(X[c].astype(object), categories=cats)
+    stub = train[["batter", "p_throws", "pull_angle", "is_gb"]]
+    _, X = add_batter_features(stub, X)
+
+    clf = models["bb_type"]
+    cum = clf.predict_proba(X[FEATS]).cumsum(axis=1)
+    types = clf.classes_[(rng.random(n)[:, None] > cum).sum(axis=1).clip(0, len(clf.classes_) - 1)]
+    pull = np.empty(n)
+    dist = np.empty(n)
+    for t in BB_TYPES:
+        idx = np.flatnonzero(types == t)
+        if not len(idx):
+            continue
+        m = models["by_type"][t]
+        r = bundle["residuals"][t][rng.integers(0, len(bundle["residuals"][t]), len(idx))]
+        pull[idx] = m["angle"].predict(X.iloc[idx][FEATS]) + r[:, 0]
+        dist[idx] = np.maximum(m["distance"].predict(X.iloc[idx][FEATS]) + r[:, 1], 5)
+    spray = -pull if stand == "R" else pull  # righties pull toward LF (negative spray angle)
+    ang = np.radians(spray)
+    return pd.DataFrame({"bb_type": types, "pull_angle": pull, "spray_angle": spray, "distance_ft": dist,
+                         "x_ft": dist * np.sin(ang), "y_ft": dist * np.cos(ang)})
+
+
+def _density(sims, xlim, ylim, bin_ft=4, sigma_ft=9):
+    """Gaussian-smoothed 2D histogram of landing spots, normalized to its peak (0-1)."""
+    from scipy.ndimage import gaussian_filter
+
+    nx, ny = int((xlim[1] - xlim[0]) / bin_ft), int((ylim[1] - ylim[0]) / bin_ft)
+    h, _, _ = np.histogram2d(sims["x_ft"], sims["y_ft"], bins=[nx, ny], range=[xlim, ylim])
+    h = gaussian_filter(h, sigma_ft / bin_ft)
+    return h / h.max() if h.max() > 0 else h
+
+
+def _heat(ax, sims, xlim, ylim):
+    from matplotlib.colors import LinearSegmentedColormap
+
+    cmap = LinearSegmentedColormap.from_list("heat", ["#ffffb2", "#fd8d3c", "#e31a1c", "#4a0010"])
+    d = _density(sims, xlim, ylim)
+    img = np.ma.masked_less(d.T, 0.06)  # leave the field visible where almost nothing lands
+    return ax.imshow(img, origin="lower", extent=[*xlim, *ylim], cmap=cmap, vmin=0, vmax=1, alpha=0.8,
+                     interpolation="bilinear", zorder=5)
+
+
+def plot_prediction(bundle, sims, title, path=None):
+    """Two heatmaps of simulated landing spots: all contact (left) and ground balls, zoomed to the infield (right)."""
+    import matplotlib.pyplot as plt
+    from baseball_data.field import plot_field, WALL_FT
+
+    fig, axes = plt.subplots(1, 2, figsize=(15, 6.5), layout="constrained")
+    plot_field(axes[0])
+    _heat(axes[0], sims, (-WALL_FT * 0.78, WALL_FT * 0.78), (-25, WALL_FT + 10))
+    parts = ", ".join(f"{t.replace('_', ' ')} {(sims['bb_type'] == t).mean():.0%}" for t in BB_TYPES)
+    axes[0].set_title(f"All batted balls ({parts})", fontsize=10)
+
+    gb = sims[sims["bb_type"] == "ground_ball"]
+    plot_field(axes[1])
+    axes[1].set_xlim(-150, 150)
+    axes[1].set_ylim(-15, 215)
+    im = _heat(axes[1], gb, (-150, 150), (-15, 215))
+    axes[1].set_title(f"Ground balls only ({len(gb) / len(sims):.0%} of contact), infield zoom", fontsize=10)
+    fig.colorbar(im, ax=axes, shrink=0.8, pad=0.02, label="relative density of landing spots (1 = hottest)")
+    fig.suptitle(title, fontsize=12)
+    if path:
+        fig.savefig(path, dpi=150, bbox_inches="tight")
+    return fig
+
+
+def cmd_predict(argv):
+    import argparse
+    ap = argparse.ArgumentParser(prog="spray_model.py predict")
+    ap.add_argument("--seasons", default="2023", help="comma list identifying the trained bundle")
+    ap.add_argument("--batter", type=int, required=True, help="MLBAM player id")
+    ap.add_argument("--p-throws", choices=["L", "R"], required=True)
+    ap.add_argument("--stand", choices=["L", "R"], help="only needed for batters not in training data")
+    ap.add_argument("--balls", type=int, default=0)
+    ap.add_argument("--strikes", type=int, default=0)
+    ap.add_argument("--outs", type=int, default=0)
+    ap.add_argument("--on1b", action="store_true")
+    ap.add_argument("--on2b", action="store_true")
+    ap.add_argument("--on3b", action="store_true")
+    ap.add_argument("--park", help="home team code, e.g. NYY (default: league mix)")
+    ap.add_argument("--pitch-type", help="e.g. FF, SL (default: all pitches)")
+    ap.add_argument("--n", type=int, default=15000, help="simulated batted balls (more = smoother heatmap)")
+    ap.add_argument("--out", help="PNG path (default: data/plots/contact_<batter>.png)")
+    a = ap.parse_args(argv)
+    bundle = load_bundle([int(s) for s in a.seasons.split(",")])
+    sims = predict_contact(bundle, a.batter, a.p_throws, a.balls, a.strikes, a.outs,
+                           int(a.on1b), int(a.on2b), int(a.on3b), park=a.park, stand=a.stand,
+                           pitch_type=a.pitch_type, n=a.n)
+    print(sims.groupby("bb_type")[["spray_angle", "distance_ft"]].agg(["mean", "median"]).round(1))
+    print("P(type):", sims["bb_type"].value_counts(normalize=True).round(3).to_dict())
+    runners = "".join(b for b, f in (("1", a.on1b), ("2", a.on2b), ("3", a.on3b)) if f) or "none"
+    out = Path(a.out) if a.out else MODEL_DIR.parent / "plots" / f"contact_{a.batter}.png"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    plot_prediction(bundle, sims, f"Batter {a.batter} vs {a.p_throws}HP | {a.balls}-{a.strikes}, "
+                                  f"{a.outs} out, runners: {runners}", out)
+    print("saved", out)
+
+
 if __name__ == "__main__":
-    usage = "usage: spray_model.py train 2023 [2022 ...] | validate <train_seasons,comma> <test_season>"
+    usage = ("usage: spray_model.py train 2023 [2022 ...] | validate <train_seasons,comma> <test_season> "
+             "| predict --batter ID --p-throws R [options]")
     if len(sys.argv) < 3:
         sys.exit(usage)
     if sys.argv[1] == "train":
         cmd_train([int(s) for s in sys.argv[2:]])
     elif sys.argv[1] == "validate" and len(sys.argv) == 4:
         cmd_validate([int(s) for s in sys.argv[2].split(",")], int(sys.argv[3]))
+    elif sys.argv[1] == "predict":
+        cmd_predict(sys.argv[2:])
     else:
         sys.exit(usage)
