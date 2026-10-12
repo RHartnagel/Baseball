@@ -26,6 +26,7 @@ from sklearn.metrics import log_loss, mean_absolute_error
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from baseball_data import statcast_pitches, add_spray  # noqa: E402
+from positioning import optimal_infield_positions, compare_to_actual, reach_for, drop_battery, FIXED, DEFAULT_REACH_FT  # noqa: E402
 
 SHRINK_K = 30  # pseudo-BIP of league-average behavior mixed into each batter estimate
 PULL_DEG = 15  # |pull_angle| thresholds for the pull/center/oppo classes
@@ -285,12 +286,14 @@ def _heat(ax, sims, xlim, ylim):
                      interpolation="bilinear", zorder=5)
 
 
-def plot_prediction(bundle, sims, title, path=None):
+def plot_prediction(bundle, sims, title, path=None, positions=None, actual=None, reach_ft=DEFAULT_REACH_FT):
     """Two heatmaps of simulated landing spots: all contact (left) and ground balls, zoomed to the infield (right)."""
     import matplotlib.pyplot as plt
     from baseball_data.field import plot_field, WALL_FT
 
     fig, axes = plt.subplots(1, 2, figsize=(15, 6.5), layout="constrained")
+    n_all = len(sims)
+    sims = drop_battery(sims)  # grounders the pitcher / catcher fields are not the infielders' to cover
     plot_field(axes[0])
     _heat(axes[0], sims, (-WALL_FT * 0.78, WALL_FT * 0.78), (-25, WALL_FT + 10))
     parts = ", ".join(f"{t.replace('_', ' ')} {(sims['bb_type'] == t).mean():.0%}" for t in BB_TYPES)
@@ -301,7 +304,20 @@ def plot_prediction(bundle, sims, title, path=None):
     axes[1].set_xlim(-150, 150)
     axes[1].set_ylim(-15, 215)
     im = _heat(axes[1], gb, (-150, 150), (-15, 215))
-    axes[1].set_title(f"Ground balls only ({len(gb) / len(sims):.0%} of contact), infield zoom", fontsize=10)
+    axes[1].set_title(f"Ground balls only, infield zoom ({len(gb) / n_all:.0%} of contact; {1 - len(sims) / n_all:.0%} "
+        f"of all contact removed as fielded by P/C)", fontsize=10)
+    for lab, ((x, y), r) in FIXED.items():
+        axes[1].add_patch(plt.Circle((x, y), r, fill=False, ls=":", ec="#444", lw=1.2, zorder=8))
+        axes[1].text(x, y, lab, ha="center", va="center", fontsize=8, color="#444", fontweight="bold", zorder=10)
+    for lab, (x, y) in (positions or {}).items():
+        axes[1].add_patch(plt.Circle((x, y), reach_for(lab, reach_ft), fill=False, ls="--", ec="black", lw=1, zorder=8))
+        axes[1].scatter(x, y, s=170, c="white", edgecolor="black", zorder=9)
+        axes[1].text(x, y, lab, ha="center", va="center", fontsize=7, fontweight="bold", zorder=10)
+    for lab, (x, y) in (actual or {}).items():
+        axes[1].scatter(x, y, s=90, marker="s", c="#1f77b4", edgecolor="white", zorder=11)
+        axes[1].text(x, y - 9, f"{lab} actual", ha="center", va="top", fontsize=7, color="#1f77b4", zorder=11)
+        if positions and lab in positions:
+            axes[1].plot([x, positions[lab][0]], [y, positions[lab][1]], c="#1f77b4", lw=1, zorder=10)
     fig.colorbar(im, ax=axes, shrink=0.8, pad=0.02, label="relative density of landing spots (1 = hottest)")
     fig.suptitle(title, fontsize=12)
     if path:
@@ -324,6 +340,11 @@ def cmd_predict(argv):
     ap.add_argument("--on3b", action="store_true")
     ap.add_argument("--park", help="home team code, e.g. NYY (default: league mix)")
     ap.add_argument("--pitch-type", help="e.g. FF, SL (default: all pitches)")
+    ap.add_argument("--reach", type=float, default=DEFAULT_REACH_FT,
+                    help="placeholder fielder reach (ft) for the coverage heuristic")
+    ap.add_argument("--no-shift-rules", action="store_true",
+                    help="drop the 2-per-side / on-the-dirt constraints")
+    ap.add_argument("--actual", help='actual positions to compare, e.g. "3B:-60,95;SS:-30,125;2B:30,125;1B:62,88"')
     ap.add_argument("--n", type=int, default=15000, help="simulated batted balls (more = smoother heatmap)")
     ap.add_argument("--out", help="PNG path (default: data/plots/contact_<batter>.png)")
     a = ap.parse_args(argv)
@@ -336,8 +357,20 @@ def cmd_predict(argv):
     runners = "".join(b for b, f in (("1", a.on1b), ("2", a.on2b), ("3", a.on3b)) if f) or "none"
     out = Path(a.out) if a.out else MODEL_DIR.parent / "plots" / f"contact_{a.batter}.png"
     out.parent.mkdir(parents=True, exist_ok=True)
+    positions, cov = optimal_infield_positions(sims, a.reach, shift_rules=not a.no_shift_rules)
+    print(f"coverage-heuristic positions (reach {a.reach:.0f} ft, expected GB coverage {cov:.1%}):")
+    for lab, (x, y) in positions.items():
+        print(f"  {lab}: x={x:+.0f} y={y:.0f}")
+    actual = None
+    if a.actual:
+        actual = {k.strip(): tuple(float(v) for v in xy.split(","))
+                  for k, xy in (item.split(":") for item in a.actual.split(";"))}
+        rows, lost = compare_to_actual(positions, actual, sims, a.reach)
+        for lab, r in rows.items():
+            print(f"  {lab}: {r['dist_ft']:.0f} ft from optimal (dx {r['dx_ft']:+.0f}, dy {r['dy_ft']:+.0f})")
+        print(f"  expected GB coverage lost vs heuristic optimum: {lost:.1%}")
     plot_prediction(bundle, sims, f"Batter {a.batter} vs {a.p_throws}HP | {a.balls}-{a.strikes}, "
-                                  f"{a.outs} out, runners: {runners}", out)
+                                  f"{a.outs} out, runners: {runners}", out, positions, actual, a.reach)
     print("saved", out)
 
 
