@@ -1,0 +1,286 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Infield positioning scenarios</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #fff; --ink: #1c2330; --muted: #5d6778; --line: #d9dee6;
+    --accent: #1f5fbf; --accent-ink: #fff; --warn-bg: #fff4d6; --warn-ink: #7a5600; --bad: #b3261e;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #14171c; --panel: #1d222a; --ink: #e6e9ee; --muted: #98a2b3; --line: #343b47;
+            --accent: #6aa3f5; --accent-ink: #0c1626; --warn-bg: #3a2f10; --warn-ink: #f0cf7a; --bad: #ff8a80; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+         font: 15px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  header { padding: 14px 20px; border-bottom: 1px solid var(--line); background: var(--panel); }
+  header h1 { margin: 0; font-size: 18px; }
+  header p { margin: 2px 0 0; color: var(--muted); font-size: 13px; }
+  main { display: grid; grid-template-columns: minmax(300px, 380px) 1fr; gap: 16px; padding: 16px 20px; }
+  @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+  section.card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px; }
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); margin: 0 0 10px; }
+  .field { margin-bottom: 12px; position: relative; }
+  label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 3px; }
+  input[type=text], input[type=number], select {
+    width: 100%; padding: 7px 9px; border: 1px solid var(--line); border-radius: 6px;
+    background: var(--bg); color: var(--ink); font: inherit; }
+  .row { display: flex; gap: 10px; }
+  .row > * { flex: 1; }
+  .hint { font-size: 12px; color: var(--muted); }
+  .menu { position: absolute; z-index: 5; left: 0; right: 0; top: 100%; background: var(--panel);
+          border: 1px solid var(--line); border-radius: 6px; box-shadow: 0 6px 18px rgba(0,0,0,.18);
+          max-height: 260px; overflow: auto; }
+  .menu div { padding: 6px 9px; cursor: pointer; display: flex; justify-content: space-between; gap: 8px; }
+  .menu div:hover, .menu div.on { background: var(--bg); }
+  .tag { font-size: 11px; padding: 1px 6px; border-radius: 10px; background: var(--warn-bg); color: var(--warn-ink);
+         white-space: nowrap; }
+  .picked { display: flex; align-items: center; gap: 8px; margin-top: 4px; font-size: 13px; }
+  .picked button { border: 0; background: none; color: var(--muted); cursor: pointer; font-size: 16px; padding: 0 4px; }
+  .steps { display: flex; align-items: center; gap: 6px; }
+  .steps button { width: 28px; height: 28px; border: 1px solid var(--line); border-radius: 6px;
+                  background: var(--bg); color: var(--ink); font-size: 16px; cursor: pointer; }
+  .steps output { min-width: 18px; text-align: center; font-weight: 600; }
+  .checks label { display: inline-flex; align-items: center; gap: 4px; margin-right: 12px; color: var(--ink); }
+  button.run { width: 100%; padding: 10px; border: 0; border-radius: 6px; background: var(--accent);
+               color: var(--accent-ink); font: inherit; font-weight: 600; cursor: pointer; }
+  button.run:disabled { opacity: .6; cursor: progress; }
+  details { margin: 6px 0 12px; }
+  summary { cursor: pointer; color: var(--muted); font-size: 13px; }
+  #result img { width: 100%; height: auto; border-radius: 6px; border: 1px solid var(--line); background: #fff; }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; margin: 6px 0 14px; }
+  th, td { text-align: right; padding: 5px 8px; border-bottom: 1px solid var(--line); }
+  th:first-child, td:first-child, th:nth-child(2), td:nth-child(2) { text-align: left; }
+  th { color: var(--muted); font-weight: 600; }
+  .err { color: var(--bad); font-weight: 600; }
+  .note { background: var(--warn-bg); color: var(--warn-ink); padding: 6px 10px; border-radius: 6px;
+          font-size: 13px; margin-bottom: 6px; }
+  .stats { display: flex; flex-wrap: wrap; gap: 8px 22px; margin: 4px 0 10px; }
+  .stats b { font-size: 18px; display: block; }
+  .stats span { font-size: 12px; color: var(--muted); }
+  .spin { display: inline-block; width: 14px; height: 14px; border: 2px solid currentColor; border-right-color: transparent;
+          border-radius: 50%; animation: sp .8s linear infinite; vertical-align: -2px; margin-right: 6px; }
+  @keyframes sp { to { transform: rotate(360deg); } }
+  .empty { color: var(--muted); padding: 40px 10px; text-align: center; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Infield positioning scenarios</h1>
+  <p>Pick a batter, pitcher, situation and four infielders. Shows where the batter is likely to hit the ball and
+     where each fielder should stand given his own range. A visualization aid, not a result.</p>
+</header>
+<main>
+  <section class="card" id="form">
+    <h2>Matchup</h2>
+    <div class="field" data-pick="batter" data-role="batter">
+      <label>Batter</label><input type="text" placeholder="Search name..." autocomplete="off">
+      <div class="picked"></div>
+    </div>
+    <div class="field" data-pick="pitcher" data-role="pitcher">
+      <label>Pitcher <span class="hint">(blank = league average of that hand)</span></label>
+      <input type="text" placeholder="Search name..." autocomplete="off">
+      <div class="picked"></div>
+    </div>
+    <div class="row">
+      <div class="field"><label>Pitcher throws</label>
+        <select id="p_throws"><option value="R">Right</option><option value="L">Left</option></select></div>
+      <div class="field"><label>Park</label><select id="park"><option value="">League mix</option></select></div>
+    </div>
+
+    <h2>Situation</h2>
+    <div class="row">
+      <div class="field"><label>Balls</label><div class="steps" data-step="balls" data-max="3">
+        <button type="button">-</button><output>0</output><button type="button">+</button></div></div>
+      <div class="field"><label>Strikes</label><div class="steps" data-step="strikes" data-max="2">
+        <button type="button">-</button><output>0</output><button type="button">+</button></div></div>
+      <div class="field"><label>Outs</label><div class="steps" data-step="outs" data-max="2">
+        <button type="button">-</button><output>0</output><button type="button">+</button></div></div>
+    </div>
+    <div class="field checks"><label>Runners</label>
+      <label><input type="checkbox" id="r1B"> 1B</label>
+      <label><input type="checkbox" id="r2B"> 2B</label>
+      <label><input type="checkbox" id="r3B"> 3B</label></div>
+
+    <h2>Infielders <span class="hint" style="text-transform:none">(blank = league average)</span></h2>
+    <div class="field" data-pick="3B" data-role="fielder"><label>Third base</label>
+      <input type="text" placeholder="Search name..." autocomplete="off"><div class="picked"></div></div>
+    <div class="field" data-pick="SS" data-role="fielder"><label>Shortstop</label>
+      <input type="text" placeholder="Search name..." autocomplete="off"><div class="picked"></div></div>
+    <div class="field" data-pick="2B" data-role="fielder"><label>Second base</label>
+      <input type="text" placeholder="Search name..." autocomplete="off"><div class="picked"></div></div>
+    <div class="field" data-pick="1B" data-role="fielder"><label>First base</label>
+      <input type="text" placeholder="Search name..." autocomplete="off"><div class="picked"></div></div>
+
+    <details>
+      <summary>Options</summary>
+      <div class="row" style="margin-top:8px">
+        <div class="field"><label>Pitch type</label><select id="pitch_type"><option value="">All</option></select></div>
+        <div class="field"><label>Seeds averaged</label>
+          <select id="n_seeds"><option>1</option><option>2</option><option selected>3</option><option>5</option></select></div>
+      </div>
+      <div class="row">
+        <div class="field"><label>Simulated balls</label><input type="number" id="n" value="6000" min="500" step="500"></div>
+        <div class="field"><label>Seed</label><input type="number" id="seed" value="0" min="0"></div>
+      </div>
+      <div class="checks"><label><input type="checkbox" id="directional" checked> Per-direction range
+        (adds little out of sample)</label></div>
+    </details>
+    <button class="run" id="run" type="button">Run scenario</button>
+    <div class="hint" id="eta" style="margin-top:6px"></div>
+  </section>
+
+  <section class="card" id="result"><div class="empty">Pick a batter and press Run. Each seed takes about 9 seconds.</div></section>
+</main>
+
+<script>
+const $ = (s, r = document) => r.querySelector(s);
+const state = { picks: {}, counts: { balls: 0, strikes: 0, outs: 0 } };
+const esc = s => String(s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+const debounce = (fn, ms) => { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; };
+
+function setPick(key, p) {
+  const box = $(`[data-pick="${key}"]`), input = $("input", box), out = $(".picked", box);
+  state.picks[key] = p;
+  input.value = "";
+  out.innerHTML = "";
+  if (!p) { input.style.display = ""; }
+  else {
+    input.style.display = "none";
+    const tag = p.has_history ? "" : ` <span class="tag">no model history: league average</span>`;
+    out.innerHTML = `<span><b>${esc(p.name)}</b> <span class="hint">${esc(p.pos || "")}` +
+      `${p.bat_side ? " · bats " + p.bat_side : ""}${p.pitch_hand ? " · throws " + p.pitch_hand : ""}</span>${tag}</span>` +
+      `<button type="button" title="Clear">×</button>`;
+    $("button", out).onclick = () => setPick(key, null);
+  }
+  if (key === "pitcher") {
+    const sel = $("#p_throws");
+    sel.disabled = !!p;
+    if (p && p.pitch_hand) sel.value = p.pitch_hand;
+  }
+}
+
+function attachPicker(box) {
+  const key = box.dataset.pick, role = box.dataset.role, input = $("input", box);
+  const menu = document.createElement("div");
+  menu.className = "menu"; menu.hidden = true; box.appendChild(menu);
+  let items = [], idx = -1;
+  const close = () => { menu.hidden = true; idx = -1; };
+  const choose = i => { if (items[i]) { setPick(key, items[i]); close(); } };
+  const paint = () => {
+    menu.innerHTML = items.length ? items.map((p, i) =>
+      `<div class="${i === idx ? "on" : ""}" data-i="${i}"><span>${esc(p.name)} <span class="hint">${esc(p.pos || "")}` +
+      `${p.active ? "" : " · inactive"}</span></span>${p.has_history ? "" : '<span class="tag">no history</span>'}</div>`
+    ).join("") : `<div class="hint">No match</div>`;
+    menu.hidden = false;
+  };
+  const search = debounce(async () => {
+    const q = input.value.trim();
+    if (q.length < 2) return close();
+    try {
+      const r = await fetch(`/api/players?role=${role}&q=${encodeURIComponent(q)}`);
+      items = await r.json(); idx = -1; paint();
+    } catch { close(); }
+  }, 150);
+  input.addEventListener("input", search);
+  input.addEventListener("keydown", e => {
+    if (e.key === "ArrowDown") { idx = Math.min(idx + 1, items.length - 1); paint(); e.preventDefault(); }
+    else if (e.key === "ArrowUp") { idx = Math.max(idx - 1, 0); paint(); e.preventDefault(); }
+    else if (e.key === "Enter") { choose(idx >= 0 ? idx : 0); e.preventDefault(); }
+    else if (e.key === "Escape") close();
+  });
+  menu.addEventListener("mousedown", e => { const d = e.target.closest("[data-i]"); if (d) choose(+d.dataset.i); });
+  input.addEventListener("blur", () => setTimeout(close, 120));
+}
+
+document.querySelectorAll("[data-pick]").forEach(attachPicker);
+document.querySelectorAll("[data-step]").forEach(el => {
+  const k = el.dataset.step, max = +el.dataset.max, [minus, plus] = el.querySelectorAll("button"), out = $("output", el);
+  const set = v => { state.counts[k] = Math.max(0, Math.min(max, v)); out.textContent = state.counts[k]; };
+  minus.onclick = () => set(state.counts[k] - 1);
+  plus.onclick = () => set(state.counts[k] + 1);
+});
+
+fetch("/api/meta").then(r => r.json()).then(m => {
+  $("#park").insertAdjacentHTML("beforeend", m.parks.map(p => `<option>${esc(p)}</option>`).join(""));
+  $("#pitch_type").insertAdjacentHTML("beforeend", m.pitch_types.map(p => `<option>${esc(p)}</option>`).join(""));
+  $("#n").max = m.max_n;
+});
+
+function updateEta() {
+  const s = +$("#n_seeds").value;
+  $("#eta").textContent = `About ${s * 9} seconds (${s} seed${s > 1 ? "s" : ""}).`;
+}
+$("#n_seeds").onchange = updateEta; updateEta();
+
+const f1 = x => (x >= 0 ? "+" : "") + x.toFixed(1);
+function render(r) {
+  const c = r.coverage, fl = r.flags;
+  const notes = [...r.notes];
+  if (!fl.batter_has_history) notes.push("Batter has no training history: league-average tendencies for his side.");
+  if (fl.pitcher_has_history === false)
+    notes.push(`Pitcher has only ${fl.pitcher_bip} batted balls in training: using the league pool for his hand.`);
+  const noteHtml = notes.map(n => `<div class="note">${esc(n)}</div>`).join("");
+  const mix = Object.entries(r.bb_mix).sort((a, b) => b[1] - a[1])
+    .map(([k, v]) => `${k.replace("_", " ")} ${(v * 100).toFixed(0)}%`).join(" · ");
+  const lineup = r.lineup.map(l => `<tr><td>${l.slot}</td><td>${esc(l.name)}${l.has_history ? "" : ' <span class="tag">no history</span>'}</td>
+      <td>${l.n_plays}</td><td>${f1(l.d_out_pct)}</td><td>${f1(l.in)}</td><td>${f1(l.to_1B)}</td><td>${f1(l.to_3B)}</td></tr>`).join("");
+  const multi = r.inputs.n_seeds > 1;
+  const spots = Object.entries(r.spots).map(([slot, s]) => {
+    const [x, y] = s.real, [ax, ay] = s.league_avg;
+    const sd = multi ? ` <span class="hint">± ${Math.max(...s.real_sd).toFixed(0)}</span>` : "";
+    return `<tr><td>${slot}</td><td>${x.toFixed(0)}, ${y.toFixed(0)}${sd}</td><td>${ax.toFixed(0)}, ${ay.toFixed(0)}</td></tr>`;
+  }).join("");
+  $("#result").innerHTML = `${noteHtml}
+    <div class="stats">
+      <div><b>${(c.real * 100).toFixed(1)}%</b><span>ground balls turned into outs at the optimum</span></div>
+      <div><b>${(c.league_avg * 100).toFixed(1)}%</b><span>with league-average fielders</span></div>
+      <div><b>${f1(c.tailoring_gain * 100)} pts</b><span>gain from tailoring spots to these fielders</span></div>
+      <div><b>${r.seconds}s</b><span>${r.inputs.n_seeds} seed${multi ? "s" : ""}, ${r.inputs.n} balls each</span></div>
+    </div>
+    <img alt="Heatmap of expected batted balls and recommended infield positions" src="data:image/png;base64,${r.plot_png_b64}">
+    <h2 style="margin-top:14px">Fielders</h2>
+    <table><thead><tr><th>Slot</th><th>Player</th><th>OAA plays</th><th>Range (pts)</th><th>In</th><th>To 1B</th><th>To 3B</th></tr></thead>
+      <tbody>${lineup}</tbody></table>
+    <h2>Recommended spots (feet from home plate: x + toward RF, y + toward CF)</h2>
+    <table><thead><tr><th>Slot</th><th>These fielders</th><th>League-average</th></tr></thead>
+      <tbody>${spots}</tbody></table>
+    <div class="hint">Batted balls: ${esc(mix)}. Range = change in out probability vs a league-average fielder, in
+      percentage points. Park dimensions, arm strength, double-play depth and runners holding are not modeled;
+      the pitcher and catcher use fixed placeholder ranges.</div>`;
+}
+
+$("#run").onclick = async () => {
+  const b = state.picks.batter;
+  if (!b) { $("#result").innerHTML = `<div class="err">Pick a batter first.</div>`; return; }
+  const fielders = {};
+  ["3B", "SS", "2B", "1B"].forEach(s => { fielders[s] = state.picks[s] ? state.picks[s].id : null; });
+  const spec = {
+    batter: b.id, pitcher: state.picks.pitcher ? state.picks.pitcher.id : null,
+    p_throws: $("#p_throws").value, park: $("#park").value || null,
+    balls: state.counts.balls, strikes: state.counts.strikes, outs: state.counts.outs,
+    runners: { "1B": $("#r1B").checked, "2B": $("#r2B").checked, "3B": $("#r3B").checked },
+    fielders, pitch_type: $("#pitch_type").value || null, n: +$("#n").value, seed: +$("#seed").value,
+    n_seeds: +$("#n_seeds").value, directional: $("#directional").checked,
+  };
+  const btn = $("#run");
+  btn.disabled = true; btn.innerHTML = `<span class="spin"></span>Running...`;
+  $("#result").innerHTML = `<div class="empty"><span class="spin"></span>Simulating and optimizing...</div>`;
+  try {
+    const r = await fetch("/api/scenario", { method: "POST", headers: { "Content-Type": "application/json" },
+                                             body: JSON.stringify(spec) });
+    const data = await r.json();
+    if (!r.ok) $("#result").innerHTML = `<div class="err">${esc(data.error || r.statusText)}</div>`;
+    else render(data);
+  } catch (e) {
+    $("#result").innerHTML = `<div class="err">Request failed: ${esc(e.message)}</div>`;
+  } finally {
+    btn.disabled = false; btn.textContent = "Run scenario";
+  }
+};
+</script>
+</body>
+</html>

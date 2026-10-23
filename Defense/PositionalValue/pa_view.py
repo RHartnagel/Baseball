@@ -66,13 +66,31 @@ def describe(out_bundle, ids, us):
     return pd.DataFrame(rows)
 
 
-def evaluate_pa(pa, spray_bundle, out_bundle, swaps=None, n=6000, seed=0, directional=True):
-    """Return dict with sims, lineup table, real-range and league-average positions + coverages."""
+def hypothetical_pa(batter, p_throws, stand=None, balls=0, strikes=0, outs=0, runners=None, park=None,
+                    inning=5, score_diff=0):
+    """A `pa` dict for a made-up plate appearance (park None = league mix, fielders league average)."""
+    return {"batter": batter, "pitcher": None, "stand": stand, "p_throws": p_throws,
+            "balls": balls, "strikes": strikes, "outs": outs,
+            "runners": {b: bool((runners or {}).get(b)) for b in ("1B", "2B", "3B")},
+            "inning": inning, "inning_topbot": "", "score_diff": score_diff, "home_team": park or "-",
+            "away_team": "hypothetical", "game_date": "",
+            "fielders": {s: None for s in SLOT_OF.values()},
+            "actual": {"hc_x": np.nan, "hc_y": np.nan, "events": None, "hit_location": None, "bb_type": None}}
+
+
+def evaluate_pa(pa, spray_bundle, out_bundle, swaps=None, n=6000, seed=0, directional=True,
+                pitcher=None, pitch_type=None):
+    """Return dict with sims, lineup table, real-range and league-average positions + coverages.
+
+    pitcher (MLBAM id) / pitch_type restrict the simulated pitches to his pitch mix / that pitch type;
+    default None marginalizes over all pitchers of that hand.
+    """
     r = pa["runners"]
     sims = spray_model.predict_contact(
         spray_bundle, pa["batter"], pa["p_throws"], pa["balls"], pa["strikes"], pa["outs"],
         int(r["1B"]), int(r["2B"]), int(r["3B"]), inning=pa["inning"], score_diff=pa["score_diff"],
-        park=pa["home_team"] if pa["home_team"] != "-" else None, stand=pa["stand"], n=n, seed=seed)
+        park=pa["home_team"] if pa["home_team"] != "-" else None, stand=pa["stand"], pitch_type=pitch_type,
+        n=n, seed=seed, pitcher=pitcher)
     sims["ev"] = out_model.sample_ev(out_bundle["ev_model"], pa["batter"], len(sims), seed)
     ids = pa_inputs(pa, swaps)
     us = {s: out_model.fielder_u(out_bundle, pid) for s, pid in ids.items()}
@@ -156,6 +174,8 @@ def main(argv=None):
     hyp.add_argument("--on2b", action="store_true")
     hyp.add_argument("--on3b", action="store_true")
     hyp.add_argument("--park", help="home team code, e.g. NYY (default: league mix)")
+    ap.add_argument("--pitcher", type=int, help="MLBAM pitcher id: simulate his own pitch mix")
+    ap.add_argument("--pitch-type", help="restrict to one pitch type, e.g. FF")
     ap.add_argument("--spray", default="2023", help="seasons of the spray bundle, comma list")
     ap.add_argument("--oaa", default="2022,2023", help="seasons of the out-model bundle, comma list")
     ap.add_argument("--fielders", help='swap fielders, e.g. "6:665742,4:663538" (Statcast numbers 3=1B 4=2B 5=3B 6=SS)')
@@ -174,19 +194,16 @@ def main(argv=None):
     else:
         if a.batter is None or a.p_throws is None:
             ap.error("hypothetical mode needs --batter and --p-throws (or give --date/--game/--ab)")
-        pa = {"batter": a.batter, "pitcher": None, "stand": a.stand, "p_throws": a.p_throws,
-              "balls": a.balls, "strikes": a.strikes, "outs": a.outs,
-              "runners": {"1B": a.on1b, "2B": a.on2b, "3B": a.on3b}, "inning": 5, "inning_topbot": "",
-              "score_diff": 0, "home_team": a.park or "-", "away_team": "hypothetical", "game_date": "",
-              "fielders": {s: None for s in SLOT_OF.values()},
-              "actual": {"hc_x": np.nan, "hc_y": np.nan, "events": None, "hit_location": None, "bb_type": None}}
+        pa = hypothetical_pa(a.batter, a.p_throws, a.stand, a.balls, a.strikes, a.outs,
+                             {"1B": a.on1b, "2B": a.on2b, "3B": a.on3b}, a.park)
         if a.show_actual:
             ap.error("--show-actual needs a real PA")
         tag = f"hyp_{a.batter}"
     spray_bundle = spray_model.load_bundle([int(s) for s in a.spray.split(",")])
     out_bundle = out_model.load_bundle([int(s) for s in a.oaa.split(",")])
     swaps = ({int(k): int(v) for k, v in (x.split(":") for x in a.fielders.split(","))} if a.fielders else None)
-    res = evaluate_pa(pa, spray_bundle, out_bundle, swaps, a.n, directional=not a.overall_only)
+    res = evaluate_pa(pa, spray_bundle, out_bundle, swaps, a.n, directional=not a.overall_only,
+                      pitcher=a.pitcher, pitch_type=a.pitch_type)
 
     print(f"PA {tag}: batter {pa['batter']} ({pa['stand']}) vs {pa['p_throws']}HP, "
           f"{pa['balls']}-{pa['strikes']}, {pa['outs']} out, runners {[b for b, f in pa['runners'].items() if f] or 'none'}")
